@@ -4,7 +4,7 @@
 **版本**: 0.9.18  
 **作者**: Marc K. Ritter, Hiroshi Shinaoka  
 **文档版本**: 1.0  
-**最后更新**: 2024年
+**最后更新**: 2026年
 
 ---
 
@@ -39,9 +39,9 @@ TensorCrossInterpolation.jl 是一个用于实现**张量交叉插值（Tensor C
 ### 1.2 核心功能
 
 1. **张量交叉插值**: 通过TCI1和TCI2算法实现高维函数的高效表示
-2. **张量训练分解**: 将高维张量分解为低秩张量训练（Tensor Train/MPS）格式
+2. **张量火车（Tensor Train）分解**: 将高维张量分解为低秩张量火车（Tensor Train/MPS）格式
 3. **自适应采样**: 自动选择最重要的采样点（pivots）
-4. **高效求和与积分**: 利用张量训练结构实现指数级加速
+4. **高效求和与积分**: 利用张量火车结构实现指数级加速
 5. **缓存机制**: 避免重复计算，提高性能
 6. **批量计算**: 支持并行化的批量函数求值
 7. **张量收缩**: 支持两个张量的高效收缩操作
@@ -123,18 +123,18 @@ TensorCrossInterpolation.jl/
 
 ### 3.1 张量交叉插值（TCI）
 
-TCI是一种将高维张量或函数表示为低秩张量训练格式的算法。
+TCI是一种将高维张量或函数表示为低秩张量火车格式的算法。
 
 #### 数学原理
 
-对于N维张量 A_{i₁,i₂,...,iₙ}，张量训练分解为：
+对于N维张量 A_{i₁,i₂,...,iₙ}，张量火车（Tensor Train）分解为：
 
 ```
 A_{i₁,i₂,...,iₙ} = Σ G^(1)_{i₁,α₁} G^(2)_{α₁,i₂,α₂} ... G^(N)_{αₙ₋₁,iₙ}
 ```
 
 其中：
-- G^(k) 是第k个站点张量
+- G^(k) 是第k个格点张量
 - αₖ 是链接维度（bond dimension）
 - 秩 = max αₖ
 
@@ -145,13 +145,13 @@ A_{i₁,i₂,...,iₙ} = Σ G^(1)_{i₁,α₁} G^(2)_{α₁,i₂,α₂} ... G^(N
 3. **可控误差**: 指定目标容差
 4. **高效求和**: 分解为线性复杂度
 
-### 3.2 张量训练（Tensor Train）
+### 3.2 张量火车（Tensor Train）
 
-张量训练（也称MPS）是高维张量的低秩分解格式。
+张量火车（也称MPS）是高维张量的低秩分解格式。
 
 #### 核心特性
 
-- **站点张量**: 每个站点i有三维张量 G^(i)，维度 r_{i-1} × d_i × r_i
+- **格点张量**: 每个站点i有三维张量 G^(i)，维度 r_{i-1} × d_i × r_i
 - **边界条件**: r₀ = rₙ = 1
 - **秩**: r = max rᵢ
 - **参数数量**: Σ r_{i-1} d_i r_i
@@ -206,7 +206,7 @@ A ≈ A(:,J) [A(I,J)]⁻¹ A(I,:)
 
 3. **张量更新**:
    - 使用LU或SVD分解
-   - 更新站点张量
+   - 更新格点张量
    - 保持正交形式
 
 4. **全局搜索**（可选）:
@@ -361,7 +361,7 @@ mutable struct TensorCI2{ValueType} <: AbstractTensorTrain{ValueType}
     Iset::Vector{Vector{MultiIndex}}        # 左索引集合
     Jset::Vector{Vector{MultiIndex}}        # 右索引集合
     localdims::Vector{Int}                   # 局部维度
-    sitetensors::Vector{Array{ValueType,3}} # 站点张量
+    sitetensors::Vector{Array{ValueType,3}} # 格点张量
     pivoterrors::Vector{Float64}             # Pivot误差
     bonderrors::Vector{Float64}              # Bond误差
     maxsamplevalue::Float64                  # 最大采样值
@@ -429,7 +429,7 @@ function sweep1site!(
 执行单站点更新:
 - `:forward`: 从左到右
 - `:backward`: 从右到左
-- 更新索引集合和站点张量
+- 更新索引集合和格点张量
 
 **makecanonical!** - 规范化
 
@@ -445,7 +445,7 @@ function makecanonical!(
 
 转换为规范形式，提高数值稳定性。
 
-### 5.2 tensortrain.jl - 张量训练
+### 5.2 tensortrain.jl - 张量火车
 
 #### 5.2.1 TensorTrain结构
 
@@ -456,7 +456,7 @@ end
 ```
 
 **N的含义**:
-- N=3: 标准张量训练（MPS）
+- N=3: 标准张量火车（MPS）
 - N=4: 矩阵乘积算符（MPO）
 
 #### 5.2.2 核心操作
@@ -735,7 +735,7 @@ crossinterpolate1(::Type{T}, f, localdims, firstpivot; kwargs...)
 optfirstpivot(f, localdims, startpoint; maxiter=100)
 ```
 
-#### 张量训练操作
+#### 张量火车操作
 
 ```julia
 # 创建
@@ -831,8 +831,8 @@ maxbonderror(tci::TensorCI2)            # 最大键误差
 lastsweeppivoterror(tci)                # 上次扫描pivot误差
 
 # 迭代和索引
-iterate(tt)                              # 迭代站点张量
-getindex(tt, i)                          # 获取第i个站点张量
+iterate(tt)                              # 迭代格点张量
+getindex(tt, i)                          # 获取第i个格点张量
 tt[i]                                    # 等价写法
 ```
 
@@ -1494,12 +1494,12 @@ localdims = fill(10, 5)
 | 术语 | 解释 |
 |------|------|
 | **TCI** | Tensor Cross Interpolation，张量交叉插值 |
-| **TT** | Tensor Train，张量训练 |
+| **TT** | Tensor Train |
 | **MPS** | Matrix Product State，矩阵乘积态 |
 | **MPO** | Matrix Product Operator，矩阵乘积算符 |
 | **Bond Dimension** | 键维度，连接相邻张量的索引维度 |
 | **Rank** | 秩，最大键维度 |
-| **Site Tensor** | 站点张量，TT中的局部张量 |
+| **Site Tensor** | 格点张量，TT中的局部张量 |
 | **Pivot** | 支点，交叉插值中的采样点 |
 | **Sweep** | 扫描，沿TT的遍历 |
 | **Local Dimension** | 局部维度，站点的物理索引大小 |
@@ -1510,7 +1510,7 @@ localdims = fill(10, 5)
 
 ## 17. 总结
 
-TensorCrossInterpolation.jl是一个强大且灵活的高维函数逼近工具包。通过张量训练分解和自适应采样，实现指数级效率处理高维问题。
+TensorCrossInterpolation.jl是一个强大且灵活的高维函数逼近工具包。通过张量火车（Tensor Train）分解和自适应采样，实现指数级效率处理高维问题。
 
 ### 关键优势
 
@@ -1574,12 +1574,12 @@ TensorCrossInterpolation.jl是一个强大且灵活的高维函数逼近工具�
 
 ## 补充1: 详细的TensorCI2内部机制
 
-### 1.1 站点张量的存储和更新机制
+### 1.1 格点张量的存储和更新机制
 
-TensorCI2维护站点张量的方式与传统张量训练有所不同：
+TensorCI2维护格点张量的方式与传统张量火车有所不同：
 
 ```julia
-# 站点张量的三种状态
+# 格点张量的三种状态
 # 1. 有效状态：sitetensor已计算且是最新的
 # 2. 无效状态：索引集合已更新，但sitetensor未更新
 # 3. 部分有效：某些切片有效，某些无效
@@ -1627,7 +1627,7 @@ function check_nesting(tci::TensorCI2)
 end
 
 # 为什么嵌套性重要？
-# 1. 保证张量训练的一致性
+# 1. 保证张量火车的一致性
 # 2. 允许高效的增量更新
 # 3. 确保误差估计的准确性
 # 4. 使得规范化过程更加稳定
@@ -1720,8 +1720,8 @@ function detailed_2site_update!(
     tci.Iset[bond+1] = new_Iset
     tci.Jset[bond] = new_Jset
     
-    # 步骤6: 更新站点张量
-    # 从LU分解中提取左站点张量
+    # 步骤6: 更新格点张量
+    # 从LU分解中提取左格点张量
     left_site = reshape(
         lu_decomp.L,
         size(two_site_tensor, 1),
@@ -1729,7 +1729,7 @@ function detailed_2site_update!(
         lu_decomp.npivot
     )
     
-    # 从LU分解中提取右站点张量
+    # 从LU分解中提取右格点张量
     right_site = reshape(
         lu_decomp.U,
         lu_decomp.npivot,
@@ -2739,7 +2739,7 @@ function health_check(tci::TensorCI2{T}; verbose::Bool=true) where {T}
         end
     end
     
-    # 2. 检查站点张量的维度
+    # 2. 检查格点张量的维度
     for (i, tensor) in enumerate(tci.sitetensors)
         expected_shape = (
             i == 1 ? 1 : length(tci.Iset[i]),
@@ -2764,7 +2764,7 @@ function health_check(tci::TensorCI2{T}; verbose::Bool=true) where {T}
     
     # 4. 检查数值稳定性
     for b in 1:length(tci)-1
-        # 检查站点张量中的NaN或Inf
+        # 检查格点张量中的NaN或Inf
         if any(isnan.(tci.sitetensors[b])) || any(isinf.(tci.sitetensors[b]))
             push!(issues, "站点 $b 包含NaN或Inf")
         end
@@ -2949,7 +2949,7 @@ function plot_tensor_norms(tci::TensorCI2)
         color=:purple
     )
     
-    title!(p, "站点张量范数")
+    title!(p, "格点张量范数")
     
     return p
 end
@@ -3197,7 +3197,7 @@ end
 
 本补充文档提供了主文档中精简的详细内容，包括：
 
-1. **TensorCI2内部机制详解** - 站点张量更新、索引集合嵌套性、pivot误差计算
+1. **TensorCI2内部机制详解** - 格点张量更新、索引集合嵌套性、pivot误差计算
 2. **批量求值高级优化** - 内存池管理、自适应批次大小、GPU加速
 3. **高级全局搜索策略** - 并行搜索、基于梯度、主动学习
 4. **数值稳定性分析** - 误差传播、自适应精度控制
@@ -3206,4 +3206,5 @@ end
 7. **性能Profile** - 详细计时、扩展性基准
 
 结合主文档和本补充文档，您将拥有超过**25000字**的完整技术资料！
+
 
