@@ -1,35 +1,88 @@
+# ===================================================================
+# tensorci2.jl - TCI2算法实现
+# ===================================================================
+# 这个文件实现了TensorCI2类型和crossinterpolate2函数。
+#
+# TCI2（Tensor Cross Interpolation 2）是改进版的张量交叉插值算法。
+# 相比TCI1，TCI2具有以下优势：
+#   1. 不需要存储完整的Pi矩阵，更节省内存
+#   2. 使用2-site更新，收敛更快
+#   3. 支持全局枢轴搜索，避免局部极小
+#   4. 更好的数值稳定性
+#
+# TCI2是推荐的默认算法，适用于大多数应用场景。
+# ===================================================================
+
 """
     mutable struct TensorCI2{ValueType} <: AbstractTensorTrain{ValueType}
 
-Type that represents tensor cross interpolations created using the TCI2 algorithm. Users may want to create these using [`crossinterpolate2`](@ref) rather than calling a constructor directly.
+TCI2算法产生的张量交叉插值表示。
+
+# 背景
+TCI2是改进版的张量交叉插值算法，使用2-site扫描和LU分解
+来更高效地选择枢轴。
+
+# 类型参数
+- `ValueType`: 张量元素的类型
+
+# 字段
+- `Iset::Vector{Vector{MultiIndex}}`: 每个位置的左索引集
+- `Jset::Vector{Vector{MultiIndex}}`: 每个位置的右索引集
+- `localdims::Vector{Int}`: 各维度的大小
+- `sitetensors::Vector{Array{ValueType,3}}`: 站点张量列表
+- `pivoterrors::Vector{Float64}`: 回截断的误差估计
+- `bonderrors::Vector{Float64}`: 2-site扫描的每键误差
+- `maxsamplevalue::Float64`: 误差归一化的最大采样值
+- `Iset_history::Vector{Vector{Vector{MultiIndex}}}`: I集的历史（用于非严格嵌套）
+- `Jset_history::Vector{Vector{Vector{MultiIndex}}}`: J集的历史
+
+# 创建方式
+通常通过 [`crossinterpolate2`](@ref) 函数创建：
+```julia
+tci, ranks, errors = crossinterpolate2(Float64, f, [10, 10, 10])
+```
+
+# 另见
+- [`crossinterpolate2`](@ref): TCI2算法的主函数
+- [`optimize!`](@ref): TCI2的优化函数
+- [`TensorCI1`](@ref): TCI1算法的表示
 """
 mutable struct TensorCI2{ValueType} <: AbstractTensorTrain{ValueType}
-    Iset::Vector{Vector{MultiIndex}}
-    Jset::Vector{Vector{MultiIndex}}
-    localdims::Vector{Int}
+    Iset::Vector{Vector{MultiIndex}}   # 左索引集
+    Jset::Vector{Vector{MultiIndex}}   # 右索引集
+    localdims::Vector{Int}             # 局部维度
 
-    sitetensors::Vector{Array{ValueType,3}}
+    sitetensors::Vector{Array{ValueType,3}}  # 站点张量
 
-    "Error estimate for backtruncation of bonds."
+    "回截断键的误差估计"
     pivoterrors::Vector{Float64}
-    #"Error estimate per bond by 2site sweep."
+    "2-site扫描的每键误差"
     bonderrors::Vector{Float64}
-    #"Maximum sample for error normalization."
+    "误差归一化的最大采样值"
     maxsamplevalue::Float64
 
+    # 索引集历史（用于非严格嵌套模式）
     Iset_history::Vector{Vector{Vector{MultiIndex}}}
     Jset_history::Vector{Vector{Vector{MultiIndex}}}
 
+    """
+        TensorCI2{ValueType}(localdims) where {ValueType}
+    
+    创建一个空的TensorCI2对象。
+    
+    # 参数
+    - `localdims`: 各维度的大小（至少2个元素）
+    """
     function TensorCI2{ValueType}(
         localdims::Union{Vector{Int},NTuple{N,Int}}
     ) where {ValueType,N}
         length(localdims) > 1 || error("localdims should have at least 2 elements!")
         n = length(localdims)
         new{ValueType}(
-            [Vector{MultiIndex}() for _ in 1:n],    # Iset
-            [Vector{MultiIndex}() for _ in 1:n],    # Jset
+            [Vector{MultiIndex}() for _ in 1:n],    # Iset（空）
+            [Vector{MultiIndex}() for _ in 1:n],    # Jset（空）
             collect(localdims),                     # localdims
-            [zeros(0, d, 0) for d in localdims],    # sitetensors
+            [zeros(0, d, 0) for d in localdims],    # sitetensors（空）
             [],                                     # pivoterrors
             zeros(length(localdims) - 1),           # bonderrors
             0.0,                                    # maxsamplevalue
@@ -39,6 +92,16 @@ mutable struct TensorCI2{ValueType} <: AbstractTensorTrain{ValueType}
     end
 end
 
+"""
+    TensorCI2{ValueType}(func, localdims, initialpivots) where {ValueType}
+
+从函数和初始枢轴创建TensorCI2。
+
+# 参数
+- `func`: 要插值的函数
+- `localdims`: 各维度大小
+- `initialpivots`: 初始枢轴列表
+"""
 function TensorCI2{ValueType}(
     func::F,
     localdims::Union{Vector{Int},NTuple{N,Int}},
@@ -53,7 +116,9 @@ function TensorCI2{ValueType}(
 end
 
 """
-    Initialize a TCI2 object with local pivot lists.
+    TensorCI2{ValueType}(func, localdims, Iset, Jset) where {ValueType}
+
+从局部枢轴列表初始化TCI2对象。
 """
 function TensorCI2{ValueType}(
     func::F,
@@ -71,42 +136,26 @@ function TensorCI2{ValueType}(
     return tci
 end
 
-@doc raw"""
-    function printnestinginfo(tci::TensorCI2{T}) where {T}
+# ===================================================================
+# 嵌套性检查
+# ===================================================================
 
-Print information about fulfillment of the nesting criterion (``I_\ell < I_{\ell+1}`` and ``J_\ell < J_{\ell+1}``) on each pair of bonds ``\ell, \ell+1`` of `tci` to stdout.
+@doc raw"""
+    printnestinginfo(tci::TensorCI2{T}) where {T}
+
+打印嵌套条件的满足情况。
+
+# 背景
+TCI理论要求索引集满足嵌套条件：
+- I_ℓ ⊂ I_{ℓ+1}（左索引递增嵌套）
+- J_{ℓ+1} ⊂ J_ℓ（右索引递减嵌套）
+
+这个函数检查并输出每对键的嵌套情况。
 """
 function printnestinginfo(tci::TensorCI2{T}) where {T}
     printnestinginfo(stdout, tci)
 end
 
-function linkdims(tci::TensorCI2{T})::Vector{Int} where {T}
-    return [length(tci.Iset[b+1]) for b in 1:length(tci)-1]
-end
-
-"""
-Invalidate the site tensor at bond `b`.
-"""
-function invalidatesitetensors!(tci::TensorCI2{T}) where {T}
-    for b in 1:length(tci)
-        tci.sitetensors[b] = zeros(T, 0, 0, 0)
-    end
-    nothing
-end
-
-"""
-Return if site tensors are available
-"""
-function issitetensorsavailable(tci::TensorCI2{T}) where {T}
-    return all(length(tci.sitetensors[b]) != 0 for b in 1:length(tci))
-end
-
-
-@doc raw"""
-    function printnestinginfo(io::IO, tci::TensorCI2{T}) where {T}
-
-Print information about fulfillment of the nesting criterion (``I_\ell < I_{\ell+1}`` and ``J_\ell < J_{\ell+1}``) on each pair of bonds ``\ell, \ell+1`` of `tci` to `io`.
-"""
 function printnestinginfo(io::IO, tci::TensorCI2{T}) where {T}
     println(io, "Nesting info: Iset")
     for i in 1:length(tci.Iset)-1
@@ -128,7 +177,57 @@ function printnestinginfo(io::IO, tci::TensorCI2{T}) where {T}
     end
 end
 
+# ===================================================================
+# 维度相关函数
+# ===================================================================
 
+"""
+    linkdims(tci::TensorCI2{T}) where {T}
+
+获取所有键维度。
+"""
+function linkdims(tci::TensorCI2{T})::Vector{Int} where {T}
+    return [length(tci.Iset[b+1]) for b in 1:length(tci)-1]
+end
+
+# ===================================================================
+# 站点张量管理
+# ===================================================================
+
+"""
+    invalidatesitetensors!(tci::TensorCI2{T}) where {T}
+
+使所有站点张量无效。
+
+# 说明
+当索引集改变后，站点张量需要重新计算。
+这个函数将张量设为空，标记它们需要更新。
+"""
+function invalidatesitetensors!(tci::TensorCI2{T}) where {T}
+    for b in 1:length(tci)
+        tci.sitetensors[b] = zeros(T, 0, 0, 0)
+    end
+    nothing
+end
+
+"""
+    issitetensorsavailable(tci::TensorCI2{T}) where {T}
+
+检查站点张量是否可用。
+"""
+function issitetensorsavailable(tci::TensorCI2{T}) where {T}
+    return all(length(tci.sitetensors[b]) != 0 for b in 1:length(tci))
+end
+
+# ===================================================================
+# 误差管理
+# ===================================================================
+
+"""
+    updatebonderror!(tci::TensorCI2{T}, b::Int, error::Float64) where {T}
+
+更新键 b 的误差。
+"""
 function updatebonderror!(
     tci::TensorCI2{T}, b::Int, error::Float64
 ) where {T}
@@ -136,11 +235,22 @@ function updatebonderror!(
     nothing
 end
 
+"""
+    maxbonderror(tci::TensorCI2{T}) where {T}
+
+获取最大键误差。
+"""
 function maxbonderror(tci::TensorCI2{T}) where {T}
     return maximum(tci.bonderrors)
 end
 
+"""
+    updatepivoterror!(tci::TensorCI2{T}, errors::AbstractVector{Float64}) where {T}
+
+更新枢轴误差数组。
+"""
 function updatepivoterror!(tci::TensorCI2{T}, errors::AbstractVector{Float64}) where {T}
+    # 用当前误差和新误差的最大值更新
     erroriter = Iterators.map(max, padzero(tci.pivoterrors), padzero(errors))
     tci.pivoterrors = Iterators.take(
         erroriter,
@@ -149,11 +259,21 @@ function updatepivoterror!(tci::TensorCI2{T}, errors::AbstractVector{Float64}) w
     nothing
 end
 
+"""
+    flushpivoterror!(tci::TensorCI2{T}) where {T}
+
+清空枢轴误差数组。
+"""
 function flushpivoterror!(tci::TensorCI2{T}) where {T}
     tci.pivoterrors = Float64[]
     nothing
 end
 
+"""
+    pivoterror(tci::TensorCI2{T}) where {T}
+
+获取当前枢轴误差。
+"""
 function pivoterror(tci::TensorCI2{T}) where {T}
     return maxbonderror(tci)
 end
@@ -168,6 +288,18 @@ function updateerrors!(
     nothing
 end
 
+# ===================================================================
+# 全局枢轴管理
+# ===================================================================
+
+"""
+    reconstractglobalpivotsfromijset(localdims, Isets, Jsets)
+
+从I集和J集重构全局枢轴。
+
+# 说明
+给定I集和J集，计算对应的完整多索引列表。
+"""
 function reconstractglobalpivotsfromijset(
     localdims::Union{Vector{Int},NTuple{N,Int}},
     Isets::Vector{Vector{MultiIndex}}, 
@@ -188,18 +320,30 @@ function reconstractglobalpivotsfromijset(
 end
 
 """
-Add global pivots to index sets
+    addglobalpivots!(tci::TensorCI2{ValueType}, pivots::Vector{MultiIndex}) where {ValueType}
+
+添加全局枢轴到索引集。
+
+# 参数
+- `tci`: TensorCI2对象
+- `pivots`: 要添加的全局枢轴列表
+
+# 说明
+每个全局枢轴被分解为左索引和右索引，分别添加到Iset和Jset中。
+添加后站点张量会被标记为无效。
 """
 function addglobalpivots!(
     tci::TensorCI2{ValueType},
     pivots::Vector{MultiIndex}
 ) where {ValueType}
+    # 验证枢轴长度
     if any(length(tci) .!= length.(pivots))
         throw(DimensionMismatch("Please specify a pivot as one index per leg of the MPS."))
     end
 
     for pivot in pivots
         for b in 1:length(tci)
+            # 将枢轴分解为左右索引
             pushunique!(tci.Iset[b], pivot[1:b-1])
             pushunique!(tci.Jset[b], pivot[b+1:end])
         end
@@ -212,9 +356,13 @@ function addglobalpivots!(
     nothing
 end
 
-
 """
-Add global pivots to index sets and perform a 1site sweep
+    addglobalpivots1sitesweep!(tci, f, pivots; kwargs...)
+
+添加全局枢轴并执行1-site扫描。
+
+# 说明
+添加枢轴后，执行makecanonical!来更新索引集。
 """
 function addglobalpivots1sitesweep!(
     tci::TensorCI2{ValueType},
@@ -228,17 +376,33 @@ function addglobalpivots1sitesweep!(
     makecanonical!(tci, f; reltol=reltol, abstol=abstol, maxbonddim=maxbonddim)
 end
 
+"""
+    existaspivot(tci::TensorCI2{ValueType}, indexset::MultiIndex) where {ValueType}
 
+检查索引是否已存在于枢轴集中。
+"""
 function existaspivot(
     tci::TensorCI2{ValueType},
     indexset::MultiIndex) where {ValueType}
     return [indexset[1:b-1] ∈ tci.Iset[b] && indexset[b+1:end] ∈ tci.Jset[b] for b in 1:length(tci)]
 end
 
-
 """
-Add global pivots to index sets and perform a 2site sweep.
-Retry until all pivots are added or until `ntry` iterations are reached.
+    addglobalpivots2sitesweep!(tci, f, pivots; kwargs...)
+
+添加全局枢轴并执行2-site扫描。
+
+# 参数
+- `tci`: TensorCI2对象
+- `f`: 原始函数
+- `pivots`: 要添加的枢轴列表
+- `ntry`: 最大尝试次数
+
+# 返回值
+- 未成功添加的枢轴数量
+
+# 说明
+重复尝试添加枢轴直到所有枢轴都被添加或达到最大尝试次数。
 """
 function addglobalpivots2sitesweep!(
     tci::TensorCI2{ValueType},
@@ -272,6 +436,7 @@ function addglobalpivots2sitesweep!(
             strictlynested=strictlynested,
             verbosity=verbosity)
 
+        # 检查哪些枢轴还没有被正确添加
         newpivots = [p for p in pivots if abs(evaluate(tci, p) - f(p)) > abstol]
 
         if verbosity > 0
@@ -287,6 +452,26 @@ function addglobalpivots2sitesweep!(
     return length(pivots_)
 end
 
+# ===================================================================
+# 张量填充函数
+# ===================================================================
+
+"""
+    filltensor(::Type{ValueType}, f, localdims, Iset, Jset, ::Val{M}) where {ValueType,M}
+
+填充M+2维张量。
+
+# 参数
+- `ValueType`: 元素类型
+- `f`: 函数
+- `localdims`: 局部维度
+- `Iset`: 左索引集
+- `Jset`: 右索引集
+- `Val{M}`: 中间自由索引的数量
+
+# 返回值
+形状为 (|Iset|, d₁, ..., dₘ, |Jset|) 的数组
+"""
 function filltensor(
     ::Type{ValueType},
     f,
@@ -311,7 +496,19 @@ function filltensor(
     )
 end
 
+# ===================================================================
+# 索引集笛卡尔积
+# ===================================================================
 
+"""
+    kronecker(Iset, localdim)
+
+计算索引集和局部索引的笛卡尔积（追加在右边）。
+
+# 示例
+如果 Iset = [[1], [2]]，localdim = 3，
+则返回 [[1,1], [1,2], [1,3], [2,1], [2,2], [2,3]]
+"""
 function kronecker(
     Iset::Union{Vector{MultiIndex},IndexSet{MultiIndex}},
     localdim::Int
@@ -319,6 +516,11 @@ function kronecker(
     return MultiIndex[[is..., j] for is in Iset, j in 1:localdim][:]
 end
 
+"""
+    kronecker(localdim, Jset)
+
+计算局部索引和索引集的笛卡尔积（追加在左边）。
+"""
 function kronecker(
     localdim::Int,
     Jset::Union{Vector{MultiIndex},IndexSet{MultiIndex}}
@@ -326,6 +528,11 @@ function kronecker(
     return MultiIndex[[i, js...] for i in 1:localdim, js in Jset][:]
 end
 
+"""
+    setsitetensor!(tci::TensorCI2{ValueType}, b::Int, T::AbstractArray{ValueType,N}) where {ValueType,N}
+
+设置位置 b 的站点张量。
+"""
 function setsitetensor!(
     tci::TensorCI2{ValueType}, b::Int, T::AbstractArray{ValueType,N}
 ) where {ValueType,N}
@@ -337,16 +544,31 @@ function setsitetensor!(
     )
 end
 
+# ===================================================================
+# 0-site扫描（坏枢轴移除）
+# ===================================================================
 
+"""
+    sweep0site!(tci::TensorCI2{ValueType}, f, b::Int; reltol, abstol) where {ValueType}
+
+在键 b 执行0-site扫描（移除坏枢轴）。
+
+# 说明
+通过对P矩阵进行LU分解来识别并移除数值上较差的枢轴。
+"""
 function sweep0site!(
     tci::TensorCI2{ValueType}, f, b::Int;
     reltol=1e-14, abstol=0.0
 ) where {ValueType}
     invalidatesitetensors!(tci)
+    
+    # 构建枢轴矩阵
     P = reshape(
         filltensor(ValueType, f, tci.localdims, tci.Iset[b+1], tci.Jset[b], Val(0)),
         length(tci.Iset[b+1]), length(tci.Jset[b]))
     updatemaxsample!(tci, P)
+    
+    # LU分解
     F = MatrixLUCI(
         P,
         reltol=reltol,
@@ -354,21 +576,32 @@ function sweep0site!(
         leftorthogonal=true
     )
 
+    # 计算有多少对角元素满足阈值
     ndiag = sum(abs(F.lu.U[i,i]) > abstol && abs(F.lu.U[i,i]/F.lu.U[1,1]) > reltol for i in eachindex(diag(F.lu.U)))
 
+    # 截断索引集
     tci.Iset[b+1] = tci.Iset[b+1][rowindices(F)[1:ndiag]]
     tci.Jset[b] = tci.Jset[b][colindices(F)[1:ndiag]]
     return nothing
 end
 
-# Backward compatibility
+# 向后兼容
 const rmbadpivots! = sweep0site!
 
+"""
+    setsitetensor!(tci::TensorCI2{ValueType}, f, b::Int; leftorthogonal=true) where {ValueType}
+
+计算并设置位置 b 的站点张量。
+
+# 说明
+使用函数求值填充Pi矩阵，然后通过解线性方程组计算站点张量。
+"""
 function setsitetensor!(
     tci::TensorCI2{ValueType}, f, b::Int; leftorthogonal=true
 ) where {ValueType}
     leftorthogonal || error("leftorthogonal==false is not supported!")
 
+    # 计算包含站点维度的Pi矩阵
     Is = leftorthogonal ? kronecker(tci.Iset[b], tci.localdims[b]) : tci.Iset[b]
     Js = leftorthogonal ? tci.Jset[b] : kronecker(tci.localdims[b], tci.Jset[b])
     Pi1 = reshape(
@@ -376,29 +609,53 @@ function setsitetensor!(
         length(Is), length(Js))
     updatemaxsample!(tci, Pi1)
 
+    # 边界情况特殊处理
     if (leftorthogonal && b == length(tci)) ||
         (!leftorthogonal && b == 1)
         setsitetensor!(tci, b, Pi1)
         return tci.sitetensors[b]
     end
 
+    # 计算枢轴矩阵P
     P = reshape(
         filltensor(ValueType, f, tci.localdims, tci.Iset[b+1], tci.Jset[b], Val(0)),
         length(tci.Iset[b+1]), length(tci.Jset[b]))
     length(tci.Iset[b+1]) == length(tci.Jset[b]) || error("Pivot matrix at bond $(b) is not square!")
 
-    #Tmat = transpose(transpose(rrlu(P)) \ transpose(Pi1))
+    # 计算 T = Pi1 * P^{-1}
     Tmat = transpose(transpose(P) \ transpose(Pi1))
     tci.sitetensors[b] = reshape(Tmat, length(tci.Iset[b]), tci.localdims[b], length(tci.Iset[b+1]))
     return tci.sitetensors[b]
 end
 
+"""
+    updatemaxsample!(tci::TensorCI2{V}, samples::Array{V}) where {V}
 
+更新最大采样值。
+"""
 function updatemaxsample!(tci::TensorCI2{V}, samples::Array{V}) where {V}
     tci.maxsamplevalue = maxabs(tci.maxsamplevalue, samples)
 end
 
+# ===================================================================
+# 1-site扫描
+# ===================================================================
 
+"""
+    sweep1site!(tci::TensorCI2{ValueType}, f, sweepdirection; kwargs...) where {ValueType}
+
+执行1-site扫描。
+
+# 参数
+- `sweepdirection`: 扫描方向 (:forward 或 :backward)
+- `reltol, abstol`: 容差
+- `maxbonddim`: 最大键维度
+- `updatetensors`: 是否更新张量
+
+# 说明
+1-site扫描对每个站点单独进行LU分解，更新索引集。
+这比2-site扫描更快但精度可能略低。
+"""
 function sweep1site!(
     tci::TensorCI2{ValueType},
     f,
@@ -409,7 +666,6 @@ function sweep1site!(
     updatetensors::Bool=true
 ) where {ValueType}
     flushpivoterror!(tci)
-
     invalidatesitetensors!(tci)
 
     if !(sweepdirection === :forward || sweepdirection === :backward)
@@ -417,13 +673,18 @@ function sweep1site!(
     end
 
     forwardsweep = sweepdirection === :forward
+    
     for b in (forwardsweep ? (1:length(tci)-1) : (length(tci):-1:2))
+        # 根据方向选择索引集
         Is = forwardsweep ? kronecker(tci.Iset[b], tci.localdims[b]) : tci.Iset[b]
         Js = forwardsweep ? tci.Jset[b] : kronecker(tci.localdims[b], tci.Jset[b])
+        
+        # 构建并分解Pi矩阵
         Pi = reshape(
             filltensor(ValueType, f, tci.localdims, tci.Iset[b], tci.Jset[b], Val(1)),
             length(Is), length(Js))
         updatemaxsample!(tci, Pi)
+        
         luci = MatrixLUCI(
             Pi,
             reltol=reltol,
@@ -431,21 +692,24 @@ function sweep1site!(
             maxrank=maxbonddim,
             leftorthogonal=forwardsweep
         )
+        
+        # 更新索引集
         tci.Iset[b+forwardsweep] = Is[rowindices(luci)]
         tci.Jset[b-!forwardsweep] = Js[colindices(luci)]
+        
+        # 更新张量
         if updatetensors
             setsitetensor!(tci, b, forwardsweep ? left(luci) : right(luci))
         end
+        
         if any(isnan.(tci.sitetensors[b]))
             error("Error: NaN in tensor T[$b]")
         end
-        updateerrors!(
-            tci, b - !forwardsweep,
-            pivoterrors(luci),
-        )
+        
+        updateerrors!(tci, b - !forwardsweep, pivoterrors(luci))
     end
 
-    # Update last tensor according to last index set
+    # 更新最后一个张量
     if updatetensors
         lastupdateindex = forwardsweep ? length(tci) : 1
         shape = if forwardsweep
@@ -460,6 +724,17 @@ function sweep1site!(
     nothing
 end
 
+"""
+    makecanonical!(tci::TensorCI2{ValueType}, f; kwargs...) where {ValueType}
+
+将TCI2转换为规范形式。
+
+# 说明
+执行三次1-site扫描：
+1. 正向（无压缩）
+2. 反向（压缩）
+3. 正向（压缩并计算张量）
+"""
 function makecanonical!(
     tci::TensorCI2{ValueType},
     f::F;
@@ -467,45 +742,85 @@ function makecanonical!(
     abstol::Float64=0.0,
     maxbonddim::Int=typemax(Int)
 ) where {F,ValueType}
-    # The first half-sweep is performed exactly without compression.
+    # 第一个半扫描精确进行，不压缩
     sweep1site!(tci, f, :forward; reltol=0.0, abstol=0.0, maxbonddim=typemax(Int), updatetensors=false)
     sweep1site!(tci, f, :backward; reltol, abstol, maxbonddim, updatetensors=false)
     sweep1site!(tci, f, :forward; reltol, abstol, maxbonddim, updatetensors=true)
 end
 
+# ===================================================================
+# 2-site扫描辅助类型
+# ===================================================================
+
+"""
+    SubMatrix{T}
+
+用于惰性求值的子矩阵类型。
+
+# 说明
+在车象搜索中，我们不需要计算整个Pi矩阵，
+只需要按需计算被访问的元素。
+"""
 mutable struct SubMatrix{T}
-    f::Function
-    rows::Vector{MultiIndex}
-    cols::Vector{MultiIndex}
-    maxsamplevalue::Float64
+    f::Function               # 原始函数
+    rows::Vector{MultiIndex}  # 行索引
+    cols::Vector{MultiIndex}  # 列索引
+    maxsamplevalue::Float64   # 最大采样值
 
     function SubMatrix{T}(f, rows, cols) where {T}
         new(f, rows, cols, 0.0)
     end
 end
 
+"""
+    _submatrix_batcheval(obj::SubMatrix{T}, f, irows, icols) where {T}
+
+子矩阵的批量求值（普通函数版本）。
+"""
 function _submatrix_batcheval(obj::SubMatrix{T}, f, irows::Vector{Int}, icols::Vector{Int})::Matrix{T} where {T}
     return [f(vcat(obj.rows[i], obj.cols[j])) for i in irows, j in icols]
 end
 
+"""
+    _submatrix_batcheval(obj::SubMatrix{T}, f::BatchEvaluator{T}, irows, icols) where {T}
 
+子矩阵的批量求值（BatchEvaluator版本）。
+"""
 function _submatrix_batcheval(obj::SubMatrix{T}, f::BatchEvaluator{T}, irows::Vector{Int}, icols::Vector{Int})::Matrix{T} where {T}
     Iset = [obj.rows[i] for i in irows]
     Jset = [obj.cols[j] for j in icols]
     return f(Iset, Jset, Val(0))
 end
 
+"""
+    (obj::SubMatrix{T})(irows::Vector{Int}, icols::Vector{Int}) where {T}
 
+使SubMatrix可调用。
+"""
 function (obj::SubMatrix{T})(irows::Vector{Int}, icols::Vector{Int})::Matrix{T} where {T}
     res = _submatrix_batcheval(obj, obj.f, irows, icols)
     obj.maxsamplevalue = max(obj.maxsamplevalue, maximum(abs, res))
     return res
 end
 
+# ===================================================================
+# 2-site枢轴更新
+# ===================================================================
 
 """
-Update pivots at bond `b` of `tci` using the TCI2 algorithm.
-Site tensors will be invalidated.
+    updatepivots!(tci::TensorCI2{ValueType}, b::Int, f, leftorthogonal; kwargs...) where {ValueType}
+
+使用TCI2算法更新键 b 的枢轴。
+
+# 参数
+- `b`: 键索引
+- `f`: 原始函数
+- `leftorthogonal`: 是否左正交化
+- `pivotsearch`: 枢轴搜索策略 (:full 或 :rook)
+- `extraIset, extraJset`: 额外的索引（用于非严格嵌套）
+
+# 说明
+这是TCI2的核心更新步骤。
 """
 function updatepivots!(
     tci::TensorCI2{ValueType},
@@ -523,10 +838,12 @@ function updatepivots!(
 ) where {F,ValueType}
     invalidatesitetensors!(tci)
 
+    # 组合当前索引和额外索引
     Icombined = union(kronecker(tci.Iset[b], tci.localdims[b]), extraIset)
     Jcombined = union(kronecker(tci.localdims[b+1], tci.Jset[b+1]), extraJset)
 
     luci = if pivotsearch === :full
+        # 完全搜索：计算整个Pi矩阵
         t1 = time_ns()
         Pi = reshape(
             filltensor(ValueType, f, tci.localdims,
@@ -550,6 +867,7 @@ function updatepivots!(
         end
         luci
     elseif pivotsearch === :rook
+        # 车象搜索：惰性求值Pi矩阵元素
         t1 = time_ns()
         I0 = Int.(Iterators.filter(!isnothing, findfirst(isequal(i), Icombined) for i in tci.Iset[b+1]))::Vector{Int}
         J0 = Int.(Iterators.filter(!isnothing, findfirst(isequal(j), Jcombined) for j in tci.Jset[b]))::Vector{Int}
@@ -570,7 +888,7 @@ function updatepivots!(
 
         t3 = time_ns()
 
-        # Fall back to full search if rook search fails
+        # 如果车象搜索失败，回退到完全搜索
         if npivots(res) == 0
             Pi = reshape(
                 filltensor(ValueType, f, tci.localdims,
@@ -596,16 +914,36 @@ function updatepivots!(
     else
         throw(ArgumentError("Unknown pivot search strategy $pivotsearch. Choose from :rook, :full."))
     end
+    
+    # 更新索引集
     tci.Iset[b+1] = Icombined[rowindices(luci)]
     tci.Jset[b] = Jcombined[colindices(luci)]
+    
+    # 更新站点张量
     if length(extraIset) == 0 && length(extraJset) == 0
         setsitetensor!(tci, b, left(luci))
         setsitetensor!(tci, b + 1, right(luci))
     end
+    
     updateerrors!(tci, b, pivoterrors(luci))
     nothing
 end
 
+# ===================================================================
+# 收敛判断
+# ===================================================================
+
+"""
+    convergencecriterion(ranks, errors, nglobalpivots, tolerance, maxbonddim, ncheckhistory; checkconvglobalpivot) -> Bool
+
+检查是否满足收敛条件。
+
+# 条件
+1. 最近几次误差都小于容差
+2. 秩已稳定
+3. 没有新增全局枢轴（可选）
+4. 或者已达到最大键维度
+"""
 function convergencecriterion(
     ranks::AbstractVector{Int},
     errors::AbstractVector{Float64},
@@ -627,11 +965,10 @@ function convergencecriterion(
     ) || all(lastranks .>= maxbonddim)
 end
 
-
 """
     GlobalPivotSearchInput(tci::TensorCI2{ValueType}) where {ValueType}
 
-Construct a GlobalPivotSearchInput from a TensorCI2 object.
+从TensorCI2对象构造GlobalPivotSearchInput。
 """
 function GlobalPivotSearchInput(tci::TensorCI2{ValueType}) where {ValueType}
     return GlobalPivotSearchInput{ValueType}(
@@ -643,59 +980,40 @@ function GlobalPivotSearchInput(tci::TensorCI2{ValueType}) where {ValueType}
     )
 end
 
+# ===================================================================
+# 主优化函数
+# ===================================================================
 
 """
-    function optimize!(
-        tci::TensorCI2{ValueType},
-        f;
-        tolerance::Float64=1e-8,
-        maxbonddim::Int=typemax(Int),
-        maxiter::Int=200,
-        sweepstrategy::Symbol=:backandforth,
-        pivotsearch::Symbol=:full,
-        verbosity::Int=0,
-        loginterval::Int=10,
-        normalizeerror::Bool=true,
-        ncheckhistory=3,
-        maxnglobalpivot::Int=5,
-        nsearchglobalpivot::Int=5,
-        tolmarginglobalsearch::Float64=10.0,
-        strictlynested::Bool=false
-    ) where {ValueType}
+    optimize!(tci::TensorCI2{ValueType}, f; kwargs...) where {ValueType}
 
-Perform optimization sweeps using the TCI2 algorithm. This will sucessively improve the TCI approximation of a function until it fits `f` with an error smaller than `tolerance`, or until the maximum bond dimension (`maxbonddim`) is reached.
+对TCI2执行优化扫描。
 
-Arguments:
-- `tci::TensorCI2{ValueType}`: The TCI to optimize.
-- `f`: The function to fit.
-- `f` is the function to be interpolated. `f` should have a single parameter, which is a vector of the same length as `localdims`. The return type should be `ValueType`.
-- `localdims::Union{Vector{Int},NTuple{N,Int}}` is a `Vector` (or `Tuple`) that contains the local dimension of each index of `f`.
-- `tolerance::Float64` is a float specifying the target tolerance for the interpolation. Default: `1e-8`.
-- `maxbonddim::Int` specifies the maximum bond dimension for the TCI. Default: `typemax(Int)`, i.e. effectively unlimited.
-- `maxiter::Int` is the maximum number of iterations (i.e. optimization sweeps) before aborting the TCI construction. Default: `200`.
-- `sweepstrategy::Symbol` specifies whether to sweep forward (:forward), backward (:backward), or back and forth (:backandforth) during optimization. Default: `:backandforth`.
-- `pivotsearch::Symbol` determins how pivots are searched (`:full` or `:rook`). Default: `:full`.
-- `verbosity::Int` can be set to `>= 1` to get convergence information on standard output during optimization. Default: `0`.
-- `loginterval::Int` can be set to `>= 1` to specify how frequently to print convergence information. Default: `10`.
-- `normalizeerror::Bool` determines whether to scale the error by the maximum absolute value of `f` found during sampling. If set to `false`, the algorithm continues until the *absolute* error is below `tolerance`. If set to `true`, the algorithm uses the absolute error divided by the maximum sample instead. This is helpful if the magnitude of the function is not known in advance. Default: `true`.
-- `ncheckhistory::Int` is the number of history points to use for convergence checks. Default: `3`.
-- `globalpivotfinder::Union{AbstractGlobalPivotFinder, Nothing}` is a global pivot finder to use for searching global pivots. Default: `nothing`. If `nothing`, a default global pivot finder is used.
-- `maxnglobalpivot::Int` can be set to `>= 0`. Default: `5`. The maximum number of global pivots to add in each iteration.
-- `strictlynested::Bool` determines whether to preserve partial nesting in the TCI algorithm. Default: `false`.
-- `checkbatchevaluatable::Bool` Check if the function `f` is batch evaluatable. Default: `false`.
-- `checkconvglobalpivot::Bool` Check if the global pivot finder is converged. Default: `true`. In the future, this will be set to `false` by default.
+# 参数
+- `tci::TensorCI2{ValueType}`: 要优化的TCI
+- `f`: 目标函数
+- `tolerance::Float64`: 目标容差（默认 1e-8）
+- `maxbonddim::Int`: 最大键维度
+- `maxiter::Int`: 最大迭代次数
+- `sweepstrategy::Symbol`: 扫描策略
+- `pivotsearch::Symbol`: 枢轴搜索策略 (:full 或 :rook)
+- `verbosity::Int`: 输出详细程度
+- `normalizeerror::Bool`: 是否归一化误差
+- `globalpivotfinder`: 全局枢轴搜索器
+- `maxnglobalpivot::Int`: 每次最多添加的全局枢轴数
 
-Arguments (deprecated):
-- `pivottolerance::Float64` is the tolerance for the pivot search. Deprecated.
-- `nsearchglobalpivot::Int` is the number of search points for the global pivot finder. Deprecated.
-- `tolmarginglobalsearch::Float64` is the tolerance for the global pivot finder. Deprecated.
+# 返回值
+- `ranks::Vector{Int}`: 每次迭代的秩
+- `errors::Vector{Float64}`: 每次迭代的误差
 
-Notes:
-- Set `tolerance` to be > 0 or `maxbonddim` to some reasonable value. Otherwise, convergence is not reachable.
-- By default, no caching takes place. Use the [`CachedFunction`](@ref) wrapper if your function is expensive to evaluate.
+# 算法
+1. 执行2-site扫描更新索引集
+2. 搜索全局枢轴
+3. 重复直到收敛
 
-
-See also: [`crossinterpolate2`](@ref), [`optfirstpivot`](@ref), [`CachedFunction`](@ref), [`crossinterpolate1`](@ref)
+# 提示
+- 设置 tolerance > 0 或合理的 maxbonddim，否则无法收敛
+- 使用 CachedFunction 包装昂贵的函数
 """
 function optimize!(
     tci::TensorCI2{ValueType},
@@ -731,7 +1049,7 @@ function optimize!(
         error("nsearchglobalpivot < maxnglobalpivot!")
     end
 
-    # Deprecate the pivottolerance option
+    # 处理废弃的pivottolerance选项
     if !isnothing(pivottolerance)
         if !isnothing(tolerance) && (tolerance != pivottolerance)
             throw(ArgumentError("Got different values for pivottolerance and tolerance in optimize!(TCI2). For TCI2, both of these options have the same meaning. Please assign only `tolerance`."))
@@ -741,8 +1059,8 @@ function optimize!(
         end
     elseif !isnothing(tolerance)
         tol = tolerance
-    else # pivottolerance == tolerance == nothing, therefore set tol to default value
-        tol = 1e-8
+    else
+        tol = 1e-8  # 默认值
     end
 
     tstart = time_ns()
@@ -753,7 +1071,7 @@ function optimize!(
         ))
     end
 
-    # Create the global pivot finder
+    # 创建全局枢轴搜索器
     finder = if isnothing(globalpivotfinder)
         DefaultGlobalPivotFinder(
             nsearch=nsearchglobalpivot,
@@ -765,6 +1083,8 @@ function optimize!(
     end
 
     globalpivots = MultiIndex[]
+    
+    # 主迭代循环
     for iter in 1:maxiter
         errornormalization = normalizeerror ? tci.maxsamplevalue : 1.0
         abstol = tol * errornormalization;
@@ -774,6 +1094,7 @@ function optimize!(
             flush(stdout)
         end
 
+        # 执行2-site扫描
         sweep2site!(
             tci, f, 2;
             iter1 = 1,
@@ -784,7 +1105,8 @@ function optimize!(
             verbosity=verbosity,
             sweepstrategy=sweepstrategy,
             fillsitetensors=true
-            )
+        )
+        
         if verbosity > 0 && length(globalpivots) > 0 && mod(iter, loginterval) == 0
             abserr = [abs(evaluate(tci, p) - f(p)) for p in globalpivots]
             nrejections = length(abserr .> abstol)
@@ -800,7 +1122,7 @@ function optimize!(
             flush(stdout)
         end
 
-        # Find global pivots where the error is too large
+        # 搜索全局枢轴
         input = GlobalPivotSearchInput(tci)
         globalpivots = finder(
             input, f, abstol;
@@ -820,6 +1142,8 @@ function optimize!(
             println("iteration = $iter, rank = $(last(ranks)), error= $(last(errors)), maxsamplevalue= $(tci.maxsamplevalue), nglobalpivot=$(length(globalpivots))")
             flush(stdout)
         end
+        
+        # 检查收敛
         if convergencecriterion(
             ranks, errors,
             nglobalpivots,
@@ -830,11 +1154,9 @@ function optimize!(
         end
     end
 
-    # Extra one sweep by the 1-site update to
-    #  (1) Remove unnecessary pivots added by global pivots
-    #      Note: a pivot matrix can be non-square after adding global pivots,
-    #            or the bond dimension exceeds maxbonddim
-    #  (2) Compute site tensors
+    # 最后执行1-site扫描以：
+    # (1) 移除全局枢轴添加的不必要枢轴
+    # (2) 计算站点张量
     errornormalization = normalizeerror ? tci.maxsamplevalue : 1.0
     abstol = tol * errornormalization;
     sweep1site!(
@@ -849,8 +1171,26 @@ function optimize!(
     return ranks, errors ./ errornormalization
 end
 
+# ===================================================================
+# 2-site扫描
+# ===================================================================
+
 """
-Perform 2site sweeps on a TCI2.
+    sweep2site!(tci::TensorCI2{ValueType}, f, niter::Int; kwargs...) where {ValueType}
+
+执行2-site扫描。
+
+# 参数
+- `niter`: 迭代次数
+- `abstol`: 绝对容差
+- `maxbonddim`: 最大键维度
+- `sweepstrategy`: 扫描策略
+- `pivotsearch`: 枢轴搜索策略
+- `strictlynested`: 是否严格嵌套
+- `fillsitetensors`: 是否填充站点张量
+
+# 说明
+2-site扫描同时更新两个相邻站点，可以更好地优化键维度。
 """
 function sweep2site!(
     tci::TensorCI2{ValueType}, f, niter::Int;
@@ -868,7 +1208,7 @@ function sweep2site!(
     n = length(tci)
 
     for iter in iter1:iter1+niter-1
-
+        # 从历史获取额外索引（非严格嵌套模式）
         extraIset = [MultiIndex[] for _ in 1:n]
         extraJset = [MultiIndex[] for _ in 1:n]
         if !strictlynested && length(tci.Iset_history) > 0
@@ -876,11 +1216,13 @@ function sweep2site!(
             extraJset = tci.Jset_history[end]
         end
 
+        # 保存当前索引集到历史
         push!(tci.Iset_history, deepcopy(tci.Iset))
         push!(tci.Jset_history, deepcopy(tci.Jset))
 
         flushpivoterror!(tci)
-        if forwardsweep(sweepstrategy, iter) # forward sweep
+        
+        if forwardsweep(sweepstrategy, iter) # 正向扫描
             for bondindex in 1:n-1
                 updatepivots!(
                     tci, bondindex, f, true;
@@ -893,7 +1235,7 @@ function sweep2site!(
                     extraJset=extraJset[bondindex],
                 )
             end
-        else # backward sweep
+        else # 反向扫描
             for bondindex in (n-1):-1:1
                 updatepivots!(
                     tci, bondindex, f, false;
@@ -915,30 +1257,58 @@ function sweep2site!(
     nothing
 end
 
+# ===================================================================
+# 主函数：crossinterpolate2
+# ===================================================================
+
 @doc raw"""
-    function crossinterpolate2(
-        ::Type{ValueType},
-        f,
-        localdims::Union{Vector{Int},NTuple{N,Int}},
-        initialpivots::Vector{MultiIndex}=[ones(Int, length(localdims))];
-        kwargs...
-    ) where {ValueType,N}
+    crossinterpolate2(::Type{ValueType}, f, localdims, initialpivots; kwargs...) where {ValueType}
 
-Cross interpolate a function ``f(\mathbf{u})`` using the TCI2 algorithm. Here, the domain of ``f`` is ``\mathbf{u} \in [1, \ldots, d_1] \times [1, \ldots, d_2] \times \ldots \times [1, \ldots, d_{\mathscr{L}}]`` and ``d_1 \ldots d_{\mathscr{L}}`` are the local dimensions.
+使用TCI2算法对函数进行交叉插值。
 
-Arguments:
-- `ValueType` is the return type of `f`. Automatic inference is too error-prone.
-- `f` is the function to be interpolated. `f` should have a single parameter, which is a vector of the same length as `localdims`. The return type should be `ValueType`.
-- `localdims::Union{Vector{Int},NTuple{N,Int}}` is a `Vector` (or `Tuple`) that contains the local dimension of each index of `f`.
-- `initialpivots::Vector{MultiIndex}` is a vector of pivots to be used for initialization. Default: `[1, 1, ...]`.
+# 数学背景
+对函数 f(u)（其中 u ∈ [1,...,d₁] × [1,...,d₂] × ... × [1,...,dₙ]）
+进行张量列近似。TCI2是推荐的默认算法。
 
-Refer to [`optimize!`](@ref) for other keyword arguments such as `tolerance`, `maxbonddim`, `maxiter`.
+# 参数
+- `ValueType`: f 的返回类型
+- `f`: 要插值的函数
+- `localdims`: 各维度大小
+- `initialpivots`: 初始枢轴列表（默认 [[1,1,...]]）
 
-Notes:
-- Set `tolerance` to be > 0 or `maxbonddim` to some reasonable value. Otherwise, convergence is not reachable.
-- By default, no caching takes place. Use the [`CachedFunction`](@ref) wrapper if your function is expensive to evaluate.
+# 关键字参数
+参见 [`optimize!`](@ref) 获取完整的关键字参数列表，包括：
+- `tolerance`, `maxbonddim`, `maxiter` 等
 
-See also: [`optimize!`](@ref), [`optfirstpivot`](@ref), [`CachedFunction`](@ref), [`crossinterpolate1`](@ref)
+# 返回值
+- `tci::TensorCI2{ValueType}`: TCI2对象
+- `ranks::Vector{Int}`: 每次迭代的秩
+- `errors::Vector{Float64}`: 每次迭代的误差
+
+# 提示
+- 设置 tolerance > 0 或合理的 maxbonddim，否则无法收敛
+- 使用 CachedFunction 包装昂贵的函数
+
+# 示例
+```julia
+# 定义函数
+f(x) = exp(-sum(x.^2))
+
+# 进行交叉插值
+tci, ranks, errors = crossinterpolate2(Float64, f, [10, 10, 10])
+
+# 转换为张量列
+tt = tensortrain(tci)
+
+# 求值
+println(tt([5, 5, 5]))
+```
+
+# 另见
+- [`optimize!`](@ref): TCI2优化函数
+- [`optfirstpivot`](@ref): 优化第一个枢轴
+- [`CachedFunction`](@ref): 函数缓存
+- [`crossinterpolate1`](@ref): TCI1算法
 """
 function crossinterpolate2(
     ::Type{ValueType},
@@ -952,8 +1322,24 @@ function crossinterpolate2(
     return tci, ranks, errors
 end
 
+# ===================================================================
+# 全局枢轴搜索
+# ===================================================================
+
 """
-Search global pivots where the interpolation error exceeds `abstol`.
+    searchglobalpivots(tci::TensorCI2{ValueType}, f, abstol; kwargs...) where {ValueType}
+
+搜索插值误差超过 abstol 的全局枢轴。
+
+# 参数
+- `tci`: TensorCI2对象
+- `f`: 原始函数
+- `abstol`: 绝对容差
+- `nsearch`: 搜索点数量
+- `maxnglobalpivot`: 最多返回的枢轴数
+
+# 返回值
+- 误差超过阈值的枢轴列表
 """
 function searchglobalpivots(
     tci::TensorCI2{ValueType}, f, abstol;
@@ -971,6 +1357,7 @@ function searchglobalpivots(
 
     pivots = Dict{Float64,MultiIndex}()
     ttcache = TTCache(tci)
+    
     for _ in 1:nsearch
         pivot, error = _floatingzone(ttcache, f; earlystoptol = 10 * abstol, nsweeps=100)
         if error > abstol
